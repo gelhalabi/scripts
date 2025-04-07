@@ -319,8 +319,11 @@ def send_email(log_filename):
         msg.attach(part)
 
         with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-            # No need for TLS or authentication with internal SMTP server
-            server.sendmail(EMAIL_SENDER, EMAIL_RECIPIENTS, msg.as_string())
+            server.ehlo()  # Identify ourselves to the SMTP server
+            server.starttls()  # Enable TLS encryption
+            server.ehlo()  # Re-identify ourselves over TLS connection
+            server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+            server.send_message(msg)
         
         logging.info("Email sent successfully with attachment")
     except Exception as e:
