@@ -294,7 +294,7 @@ def send_email(log_filename):
         logging.info("Sending email...")
         
         # Generate statistics for email body
-        hourly_data, invalid_counts = generate_hourly_stats(weather_data)
+        hourly_data, invalid_counts = generate_hourly_stats(weather_data)  # Add weather_data as global
         email_body = format_email_body(hourly_data, invalid_counts)
         
         msg = MIMEMultipart()
@@ -319,11 +319,9 @@ def send_email(log_filename):
         msg.attach(part)
 
         with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
-            server.ehlo()  # Identify ourselves to the SMTP server
-            server.starttls()  # Enable TLS encryption
-            server.ehlo()  # Re-identify ourselves over TLS connection
+            server.starttls()
             server.login(EMAIL_SENDER, EMAIL_PASSWORD)
-            server.send_message(msg)
+            server.sendmail(EMAIL_SENDER, EMAIL_RECIPIENTS, msg.as_string())
         
         logging.info("Email sent successfully with attachment")
     except Exception as e:
