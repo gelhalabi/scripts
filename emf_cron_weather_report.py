@@ -381,11 +381,8 @@ def calculate_dust_daily_stats(data):
 def format_email_body(hourly_data, invalid_counts, dust_hourly_data=None, dust_invalid_counts=None, dust_data_raw=None):
     """Format the email body with statistics"""
     now = datetime.datetime.now(CHILE_TZ)
-    body = [f"Weather data {now.strftime('%Y/%m/%d')}\n\n"]
-    
-    # Add daily statistics section
-    stats = calculate_daily_stats(weather_data)
-    body.append("Daily Statistics\n----------------\n\n")
+    body = [f"EMF Weather & Dust Report - {now.strftime('%Y/%m/%d')}\n"]
+    body.append("="*60 + "\n\n")
     
     # Helper function to format value with timestamp
     def format_stat_with_time(stat, unit):
@@ -395,6 +392,10 @@ def format_email_body(hourly_data, invalid_counts, dust_hourly_data=None, dust_i
                 return f"{value:.2f} {unit} at {timestamp.strftime('%H:%M:%S')}"
         return "N/A"
     
+    # ========== WEATHER DAILY SUMMARY ==========
+    stats = calculate_daily_stats(weather_data)
+    body.append("WEATHER DAILY SUMMARY\n")
+    body.append("-" * 30 + "\n")
     body.append(f"Maximum Wind Speed: {format_stat_with_time(stats['wind_speed_max'], 'm/s')}\n")
     body.append(f"Minimum Wind Speed: {format_stat_with_time(stats['wind_speed_min'], 'm/s')}\n")
     body.append(f"Average Wind Speed: {stats['wind_speed_avg']:.2f} m/s\n" if isinstance(stats['wind_speed_avg'], (int, float)) else "Average Wind Speed: N/A\n")
@@ -405,40 +406,12 @@ def format_email_body(hourly_data, invalid_counts, dust_hourly_data=None, dust_i
     body.append(f"Average Wind Direction: {stats['wind_dir_avg']:.2f}°\n" if isinstance(stats['wind_dir_avg'], (int, float)) else "Average Wind Direction: N/A\n")
     body.append("\n")
     
-    # Invalid data summary
-    body.append("Sensors that had INVALID data\n-----------------------------\n\n")
-    for type_code, counts in sorted(invalid_counts.items()):
-        display_name = TYPE_CODE_MAP.get(type_code, type_code).replace('_', ' ').title()
-        for height, count in zip(SENSOR_HEIGHTS, counts):
-            if count > 0:
-                body.append(f"{display_name}[{height}]: {count} invalid samples\n")
-    
-    # Hourly records for each type
-    for type_code, hours in sorted(hourly_data.items()):
-        display_name = TYPE_NAMES.get(TYPE_CODE_MAP.get(type_code, type_code), type_code)
-        body.append(f"\n\n{display_name} records\n-------------------\n\n")
-        
-        for hour in sorted(hours.keys()):
-            values = hours[hour]
-            formatted_values = []
-            for v in values:
-                if v == 'INV':
-                    formatted_values.append(f"{v:>7}")
-                elif isinstance(v, float):
-                    formatted_values.append(f"{v:>7.2f}")  # Format to 2 decimal places
-                else:
-                    formatted_values.append(f"{v:>7}")
-            
-            body.append(f"        {hour.strftime('%Y/%m/%d %H:%M:%S')}    {' '.join(formatted_values)}\n")
-    
-    # Add dust sensor section if dust data is provided
+    # ========== DUST SENSOR DAILY SUMMARY ==========
     if dust_hourly_data and dust_data_raw:
-        body.append("\n\n" + "="*60 + "\n")
-        body.append(f"Dust Sensor Data {now.strftime('%Y/%m/%d')}\n\n")
-        
-        # Dust sensor daily statistics
         dust_stats = calculate_dust_daily_stats(dust_data_raw)
-        body.append("Daily Maximum Particle Counts\n-----------------------------\n\n")
+        body.append("DUST SENSOR DAILY SUMMARY\n")
+        body.append("-" * 30 + "\n")
+        body.append("Daily Maximum Particle Counts:\n\n")
         
         for sensor_code in ['DUST1', 'DUST2']:
             sensor_name = TYPE_NAMES.get(sensor_code, sensor_code)
@@ -453,26 +426,91 @@ def format_email_body(hourly_data, invalid_counts, dust_hourly_data=None, dust_i
                 else:
                     body.append(f"  {bin_label:>10}: N/A\n")
             body.append("\n")
+    
+    # ========== INVALID DATA SUMMARY ==========
+    has_invalid_weather = any(any(counts) for counts in invalid_counts.values())
+    has_invalid_dust = dust_invalid_counts and any(dust_invalid_counts.values())
+    
+    if has_invalid_weather or has_invalid_dust:
+        body.append("INVALID DATA SUMMARY\n")
+        body.append("-" * 30 + "\n")
         
-        # Invalid dust sensor data summary
-        if dust_invalid_counts and any(dust_invalid_counts.values()):
-            body.append("Dust Sensors with INVALID data\n-------------------------------\n\n")
+        if has_invalid_weather:
+            for type_code, counts in sorted(invalid_counts.items()):
+                display_name = TYPE_CODE_MAP.get(type_code, type_code)
+                for height, count in zip(SENSOR_HEIGHTS, counts):
+                    if count > 0:
+                        body.append(f"Weather {display_name}[{height}]: {count} samples\n")
+        
+        if has_invalid_dust:
             for sensor_code, count in sorted(dust_invalid_counts.items()):
                 if count > 0:
                     sensor_name = TYPE_NAMES.get(sensor_code, sensor_code)
-                    body.append(f"{sensor_name}: {count} invalid samples\n")
+                    body.append(f"{sensor_name}: {count} samples\n")
+        body.append("\n")
+    
+    body.append("="*60 + "\n")
+    body.append("HOURLY RECORDS\n")
+    body.append("="*60 + "\n\n")
+    
+    # ========== HOURLY RECORDS IN PRIORITY ORDER ==========
+    # Priority: 1) Temperature, 2) Wind Speed, 3) Humidity, 4) Precipitation, 5) Dust, then rest
+    priority_order = ['TEMPERATURE', 'WIND_SPEED', 'HUMIDITY', 'PRECIPITATION']
+    
+    # First, show priority weather data
+    for priority_type in priority_order:
+        if priority_type in hourly_data:
+            type_code = TYPE_CODE_MAP.get(priority_type, priority_type)
+            display_name = TYPE_NAMES.get(type_code, priority_type)
+            body.append(f"{display_name} Records\n")
+            body.append("-" * 30 + "\n")
+            
+            for hour in sorted(hourly_data[priority_type].keys()):
+                values = hourly_data[priority_type][hour]
+                formatted_values = []
+                for v in values:
+                    if v == 'INV':
+                        formatted_values.append(f"{v:>7}")
+                    elif isinstance(v, float):
+                        formatted_values.append(f"{v:>7.2f}")
+                    else:
+                        formatted_values.append(f"{v:>7}")
+                body.append(f"{hour.strftime('%Y/%m/%d %H:%M')}  {' '.join(formatted_values)}\n")
             body.append("\n")
-        
-        # Hourly average records for dust sensors
+    
+    # Dust sensor data
+    if dust_hourly_data:
         for sensor_code in sorted(dust_hourly_data.keys()):
             sensor_name = TYPE_NAMES.get(sensor_code, sensor_code)
-            body.append(f"\n{sensor_name} Hourly Averages\n" + "-" * len(f"{sensor_name} Hourly Averages") + "\n")
-            body.append(f"        Date/Time              {' '.join([f'{bin:>8}' for bin in DUST_PARTICLE_BINS])}\n")
+            body.append(f"{sensor_name} Hourly Averages\n")
+            body.append("-" * 30 + "\n")
+            body.append(f"Time             {' '.join([f'{bin:>7}' for bin in DUST_PARTICLE_BINS])}\n")
             
             for hour in sorted(dust_hourly_data[sensor_code].keys()):
                 averages = dust_hourly_data[sensor_code][hour]
-                formatted_averages = [f"{avg:>8.1f}" for avg in averages]
-                body.append(f"        {hour.strftime('%Y/%m/%d %H:%M:%S')}    {' '.join(formatted_averages)}\n")
+                formatted_averages = [f"{avg:>7.1f}" for avg in averages]
+                body.append(f"{hour.strftime('%Y/%m/%d %H:%M')}  {' '.join(formatted_averages)}\n")
+            body.append("\n")
+    
+    # Then show remaining weather data
+    for type_code in sorted(hourly_data.keys()):
+        if type_code not in priority_order:
+            display_name = TYPE_NAMES.get(TYPE_CODE_MAP.get(type_code, type_code), type_code)
+            body.append(f"{display_name} Records\n")
+            body.append("-" * 30 + "\n")
+            
+            for hour in sorted(hourly_data[type_code].keys()):
+                values = hourly_data[type_code][hour]
+                formatted_values = []
+                for v in values:
+                    if v == 'INV':
+                        formatted_values.append(f"{v:>7}")
+                    elif isinstance(v, float):
+                        formatted_values.append(f"{v:>7.2f}")
+                    else:
+                        formatted_values.append(f"{v:>7}")
+                body.append(f"{hour.strftime('%Y/%m/%d %H:%M')}  {' '.join(formatted_values)}\n")
+            body.append("\n")
     
     return "".join(body)
 
