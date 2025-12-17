@@ -47,7 +47,9 @@ TYPE_CODE_MAP = {
     'TEMPERATURE': 'T',
     'HUMIDITY': 'H',
     'PRECIPITATION': 'PREC',
-    'BAROMETRIC_TREND': 'BT'
+    'BAROMETRIC_TREND': 'BT',
+    'MT1_PARTICLES': 'DUST1',
+    'MT2_PARTICLES': 'DUST2'
 }
 
 # Add full type name mapping
@@ -60,10 +62,15 @@ TYPE_NAMES = {
     'P': 'Pressure',
     'WD': 'Wind Direction',
     'BT': 'Barometric Trend',
+    'DUST1': 'Dust Sensor MT1',
+    'DUST2': 'Dust Sensor MT2'
 }
 
 # Constants for sensor heights
 SENSOR_HEIGHTS = ['12m', '24m', '36m', '48m']
+
+# Constants for dust sensor particle size bins
+DUST_PARTICLE_BINS = ['0.3μm', '0.5μm', '0.7μm', '1.0μm', '2.0μm', '3.0μm', '5.0μm', '10.0μm']
 
 # Error handling for MongoDB connection
 def fetch_weather_data():
@@ -80,25 +87,25 @@ def fetch_weather_data():
         start_time = now - datetime.timedelta(days=1)
         timestamp_ns = int(start_time.timestamp() * 1e9)
         
-        # Query for all EMF weather control records from past day
+        # Query for all EMF weather control and dust control records from past day
         query = {
             "ts": {"$gte": timestamp_ns},
-            "src": {"$regex": "emf_weather_ctrl"}
+            "src": {"$regex": "emf_(weather|dust)_ctrl"}
         }
         
-        logging.info(f"Querying EMF weather records from {start_time} to {now}")
+        logging.info(f"Querying EMF weather and dust records from {start_time} to {now}")
         count = collection.count_documents(query)
-        logging.info(f"Found {count} EMF weather records")
+        logging.info(f"Found {count} EMF weather and dust records")
         
         if count == 0:
-            logging.warning("No EMF weather records found in the specified period")
+            logging.warning("No EMF weather or dust records found in the specified period")
             return []
             
         # Get all records with sorting, no limit
         weather_data = list(collection.find(query).sort("ts", -1))
         
         client.close()
-        logging.info(f"Retrieved all {len(weather_data)} EMF weather records for the past 24 hours")
+        logging.info(f"Retrieved all {len(weather_data)} EMF weather and dust records for the past 24 hours")
         return weather_data
         
     except Exception as e:
@@ -151,6 +158,52 @@ def generate_weather_log(data):
         logging.error(f"Error generating weather log: {e}")
         raise
 
+# Format dust sensor data into a separate log file
+def generate_dust_log(data):
+    try:
+        logging.info("Generating dust sensor log...")
+        now = datetime.datetime.now(CHILE_TZ)
+        log_filename = f"/home/gmto/emf_logs/emf_dust_log_{now.strftime('%Y%m%d')}.txt"
+        
+        os.makedirs(os.path.dirname(log_filename), exist_ok=True)
+
+        with open(log_filename, "w") as log_file:
+            # Header with particle bin labels
+            header = "Date; Sensor; " + "; ".join(DUST_PARTICLE_BINS) + "; Valid\n"
+            log_file.write(header)
+            
+            for entry in data:
+                # Convert UTC timestamp to Chile time
+                utc_dt = datetime.datetime.utcfromtimestamp(entry["ts"] / 1e9)
+                utc_dt = utc_dt.replace(tzinfo=pytz.UTC)
+                chile_dt = utc_dt.astimezone(CHILE_TZ)
+                ts = chile_dt.strftime('%Y/%m/%d %H:%M:%S')
+                
+                src = entry["src"]
+                value = entry["value"]
+                
+                # Extract sensor name (mt1_particles or mt2_particles)
+                sensor_name = src.split('/')[-2].upper()
+                sensor_code = TYPE_CODE_MAP.get(sensor_name, sensor_name)
+                
+                # Format values and valid flag (string format for dust sensors)
+                if isinstance(value, dict) and 'values' in value:
+                    # Get the 8 particle bin values
+                    values = [str(v) for v in value.get('values', [0]*8)]
+                    values_str = '; '.join(values)
+                    
+                    # Get valid flag (single string, not array)
+                    valid_flag = value.get('valid', 'UNKNOWN')
+                    valid_str = 'YES' if valid_flag == 'VALID' else 'NO'
+                    
+                    log_file.write(f"{ts}; {sensor_code}; {values_str}; {valid_str}\n")
+        
+        logging.info(f"Dust sensor log generated: {log_filename}")
+        return log_filename
+    except Exception as e:
+        logging.error(f"Error generating dust sensor log: {e}")
+        raise
+
 def generate_hourly_stats(data):
     """Generate hourly statistics for each measurement type"""
     hourly_data = {}
@@ -187,6 +240,59 @@ def generate_hourly_stats(data):
                 hourly_data[type_code][hour_ts] = values
     
     return hourly_data, invalid_counts
+
+def generate_dust_hourly_stats(data):
+    """Generate hourly average statistics for dust sensors"""
+    hourly_data = {}  # {sensor_code: {hour: {bin_index: [values]}}}
+    invalid_counts = {}  # {sensor_code: count}
+    
+    for entry in data:
+        ts = datetime.datetime.utcfromtimestamp(entry["ts"] / 1e9)
+        ts = ts.replace(tzinfo=pytz.UTC).astimezone(CHILE_TZ)
+        # Round to nearest hour
+        hour_ts = ts.replace(minute=0, second=0, microsecond=0)
+        
+        sensor_name = entry["src"].split('/')[-2].upper()
+        sensor_code = TYPE_CODE_MAP.get(sensor_name, sensor_name)
+        value = entry["value"]
+        
+        if isinstance(value, dict) and 'values' in value:
+            # Initialize data structures if needed
+            if sensor_code not in hourly_data:
+                hourly_data[sensor_code] = {}
+            if sensor_code not in invalid_counts:
+                invalid_counts[sensor_code] = 0
+            
+            # Check validation (single string for dust sensors)
+            valid_flag = value.get('valid', 'UNKNOWN')
+            if valid_flag != 'VALID':
+                invalid_counts[sensor_code] += 1
+                continue  # Skip invalid readings
+            
+            # Initialize hour if needed
+            if hour_ts not in hourly_data[sensor_code]:
+                hourly_data[sensor_code][hour_ts] = {i: [] for i in range(8)}
+            
+            # Collect values for each bin
+            for i, bin_value in enumerate(value.get('values', [])):
+                hourly_data[sensor_code][hour_ts][i].append(bin_value)
+    
+    # Calculate averages for each hour/sensor/bin
+    hourly_averages = {}
+    for sensor_code, hours in hourly_data.items():
+        hourly_averages[sensor_code] = {}
+        for hour_ts, bins in hours.items():
+            # Calculate average for each bin
+            averages = []
+            for i in range(8):
+                bin_values = bins[i]
+                if bin_values:
+                    averages.append(sum(bin_values) / len(bin_values))
+                else:
+                    averages.append(0)
+            hourly_averages[sensor_code][hour_ts] = averages
+    
+    return hourly_averages, invalid_counts
 
 def calculate_daily_stats(data):
     """Calculate daily statistics for weather measurements"""
@@ -233,7 +339,46 @@ def calculate_daily_stats(data):
     
     return stats
 
-def format_email_body(hourly_data, invalid_counts):
+def calculate_dust_daily_stats(data):
+    """Calculate daily maximum statistics for dust sensor measurements"""
+    # Initialize dictionaries for each sensor's bins: {sensor_code: {bin_index: [(value, timestamp)]}}
+    dust_data = {'DUST1': {i: [] for i in range(8)}, 'DUST2': {i: [] for i in range(8)}}
+    
+    for entry in data:
+        sensor_name = entry["src"].split('/')[-2].upper()
+        sensor_code = TYPE_CODE_MAP.get(sensor_name, sensor_name)
+        value = entry["value"]
+        
+        if isinstance(value, dict) and 'values' in value:
+            # Convert timestamp to Chile time
+            ts = datetime.datetime.utcfromtimestamp(entry["ts"] / 1e9)
+            ts = ts.replace(tzinfo=pytz.UTC).astimezone(CHILE_TZ)
+            
+            # Only consider valid measurements (string format for dust sensors)
+            valid_flag = value.get('valid', 'UNKNOWN')
+            if valid_flag == 'VALID':
+                bin_values = value.get('values', [])
+                # Store each bin value with timestamp
+                for i, bin_val in enumerate(bin_values):
+                    if i < 8:  # Ensure we have 8 bins
+                        dust_data[sensor_code][i].append((bin_val, ts))
+    
+    # Calculate max for each sensor and each bin
+    stats = {}
+    for sensor_code in ['DUST1', 'DUST2']:
+        stats[sensor_code] = {}
+        for i in range(8):
+            bin_label = DUST_PARTICLE_BINS[i]
+            bin_data = dust_data[sensor_code][i]
+            if bin_data:
+                max_entry = max(bin_data, key=lambda x: x[0])
+                stats[sensor_code][bin_label] = max_entry
+            else:
+                stats[sensor_code][bin_label] = ('N/A', None)
+    
+    return stats
+
+def format_email_body(hourly_data, invalid_counts, dust_hourly_data=None, dust_invalid_counts=None, dust_data_raw=None):
     """Format the email body with statistics"""
     now = datetime.datetime.now(CHILE_TZ)
     body = [f"Weather data {now.strftime('%Y/%m/%d')}\n\n"]
@@ -286,16 +431,67 @@ def format_email_body(hourly_data, invalid_counts):
             
             body.append(f"        {hour.strftime('%Y/%m/%d %H:%M:%S')}    {' '.join(formatted_values)}\n")
     
+    # Add dust sensor section if dust data is provided
+    if dust_hourly_data and dust_data_raw:
+        body.append("\n\n" + "="*60 + "\n")
+        body.append(f"Dust Sensor Data {now.strftime('%Y/%m/%d')}\n\n")
+        
+        # Dust sensor daily statistics
+        dust_stats = calculate_dust_daily_stats(dust_data_raw)
+        body.append("Daily Maximum Particle Counts\n-----------------------------\n\n")
+        
+        for sensor_code in ['DUST1', 'DUST2']:
+            sensor_name = TYPE_NAMES.get(sensor_code, sensor_code)
+            body.append(f"{sensor_name}:\n")
+            for bin_label, stat in dust_stats[sensor_code].items():
+                if isinstance(stat, tuple):
+                    value, timestamp = stat
+                    if isinstance(value, (int, float)) and timestamp:
+                        body.append(f"  {bin_label:>10}: {value:>6.0f} particles at {timestamp.strftime('%H:%M:%S')}\n")
+                    else:
+                        body.append(f"  {bin_label:>10}: N/A\n")
+                else:
+                    body.append(f"  {bin_label:>10}: N/A\n")
+            body.append("\n")
+        
+        # Invalid dust sensor data summary
+        if dust_invalid_counts and any(dust_invalid_counts.values()):
+            body.append("Dust Sensors with INVALID data\n-------------------------------\n\n")
+            for sensor_code, count in sorted(dust_invalid_counts.items()):
+                if count > 0:
+                    sensor_name = TYPE_NAMES.get(sensor_code, sensor_code)
+                    body.append(f"{sensor_name}: {count} invalid samples\n")
+            body.append("\n")
+        
+        # Hourly average records for dust sensors
+        for sensor_code in sorted(dust_hourly_data.keys()):
+            sensor_name = TYPE_NAMES.get(sensor_code, sensor_code)
+            body.append(f"\n{sensor_name} Hourly Averages\n" + "-" * len(f"{sensor_name} Hourly Averages") + "\n")
+            body.append(f"        Date/Time              {' '.join([f'{bin:>8}' for bin in DUST_PARTICLE_BINS])}\n")
+            
+            for hour in sorted(dust_hourly_data[sensor_code].keys()):
+                averages = dust_hourly_data[sensor_code][hour]
+                formatted_averages = [f"{avg:>8.1f}" for avg in averages]
+                body.append(f"        {hour.strftime('%Y/%m/%d %H:%M:%S')}    {' '.join(formatted_averages)}\n")
+    
     return "".join(body)
 
-# Send email with the log file
-def send_email(log_filename):
+# Send email with the log files
+def send_email(weather_log_filename, dust_log_filename=None):
     try:
         logging.info("Sending email...")
         
         # Generate statistics for email body
-        hourly_data, invalid_counts = generate_hourly_stats(weather_data)  # Add weather_data as global
-        email_body = format_email_body(hourly_data, invalid_counts)
+        hourly_data, invalid_counts = generate_hourly_stats(weather_data)
+        
+        # Generate dust statistics if dust data exists
+        dust_hourly_data = None
+        dust_invalid_counts = None
+        if dust_data:
+            dust_hourly_data, dust_invalid_counts = generate_dust_hourly_stats(dust_data)
+        
+        email_body = format_email_body(hourly_data, invalid_counts, 
+                                       dust_hourly_data, dust_invalid_counts, dust_data)
         
         msg = MIMEMultipart()
         now = datetime.datetime.now(CHILE_TZ)
@@ -306,24 +502,37 @@ def send_email(log_filename):
         # Add the detailed report to email body
         msg.attach(MIMEText(email_body, "plain"))
         
-        # Attach the log file
-        with open(log_filename, "rb") as attachment:
+        # Attach the weather log file
+        with open(weather_log_filename, "rb") as attachment:
             part = MIMEBase("application", "octet-stream")
             part.set_payload(attachment.read())
         
         encoders.encode_base64(part)
         part.add_header(
             "Content-Disposition",
-            f"attachment; filename={os.path.basename(log_filename)}"
+            f"attachment; filename={os.path.basename(weather_log_filename)}"
         )
         msg.attach(part)
+        
+        # Attach the dust log file if it exists
+        if dust_log_filename and os.path.exists(dust_log_filename):
+            with open(dust_log_filename, "rb") as attachment:
+                part = MIMEBase("application", "octet-stream")
+                part.set_payload(attachment.read())
+            
+            encoders.encode_base64(part)
+            part.add_header(
+                "Content-Disposition",
+                f"attachment; filename={os.path.basename(dust_log_filename)}"
+            )
+            msg.attach(part)
 
         with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
             server.starttls()
             server.login(EMAIL_SENDER, EMAIL_PASSWORD)
             server.sendmail(EMAIL_SENDER, EMAIL_RECIPIENTS, msg.as_string())
         
-        logging.info("Email sent successfully with attachment")
+        logging.info("Email sent successfully with attachments")
     except Exception as e:
         logging.error(f"Error sending email: {e}")
         raise
@@ -331,15 +540,40 @@ def send_email(log_filename):
 # Main execution
 if __name__ == "__main__":
     try:
-        logging.info("Starting weather report generation...")
-        weather_data = fetch_weather_data()  # Make this global for email body generation
-        if not weather_data:
-            logging.warning("No weather data found for the specified period")
+        logging.info("Starting weather and dust report generation...")
+        all_data = fetch_weather_data()
+        if not all_data:
+            logging.warning("No weather or dust data found for the specified period")
             exit(0)
+        
+        # Split data into weather and dust based on src field
+        weather_data = [entry for entry in all_data if 'emf_weather_ctrl' in entry.get('src', '')]
+        dust_data = [entry for entry in all_data if 'emf_dust_ctrl' in entry.get('src', '')]
+        
+        logging.info(f"Split data: {len(weather_data)} weather records, {len(dust_data)} dust records")
+        
+        # Generate weather log if we have weather data
+        weather_log_file = None
+        if weather_data:
+            weather_log_file = generate_weather_log(weather_data)
+        else:
+            logging.warning("No weather data to process")
+        
+        # Generate dust log if we have dust data
+        dust_log_file = None
+        if dust_data:
+            dust_log_file = generate_dust_log(dust_data)
+        else:
+            logging.warning("No dust sensor data to process")
+        
+        # Send email with available logs
+        if weather_log_file:
+            send_email(weather_log_file, dust_log_file)
+            logging.info("Weather and dust report process completed successfully")
+        else:
+            logging.error("No weather data available, cannot send report")
+            exit(1)
             
-        log_file = generate_weather_log(weather_data)
-        send_email(log_file)
-        logging.info("Weather report process completed successfully")
     except Exception as e:
-        logging.error(f"Weather report process failed: {e}")
+        logging.error(f"Weather and dust report process failed: {e}")
         raise
